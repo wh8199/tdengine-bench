@@ -7,11 +7,54 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/buger/jsonparser"
 )
+
+var (
+	GlobalCache map[string]*SQLCache = map[string]*SQLCache{}
+	CacheLock   sync.RWMutex
+)
+
+func isInit(deviceID string) bool {
+	CacheLock.RLock()
+	defer CacheLock.RUnlock()
+
+	return GlobalCache[deviceID] != nil
+}
+
+func initCache(deviceID, schemaSQL string) {
+	CacheLock.Lock()
+	defer CacheLock.Unlock()
+
+	GlobalCache[deviceID] = &SQLCache{
+		DeviceID:  deviceID,
+		SchemaSQL: schemaSQL,
+		DataSQLs:  []string{},
+		buf:       &bytes.Buffer{},
+	}
+}
+
+func addCache(deviceID, sql string, batchSize int) string {
+	CacheLock.Lock()
+	defer CacheLock.Unlock()
+
+	GlobalCache[deviceID].DataSQLs = append(GlobalCache[deviceID].DataSQLs, sql)
+	GlobalCache[deviceID].count++
+
+	if GlobalCache[deviceID].count >= batchSize {
+		sql := GlobalCache[deviceID].String()
+
+		GlobalCache[deviceID].count = 0
+		GlobalCache[deviceID].DataSQLs = GlobalCache[deviceID].DataSQLs[:0]
+		return sql
+	}
+
+	return ""
+}
 
 type Output struct {
 	Concurrent      int
@@ -61,11 +104,9 @@ type Worker struct {
 	dataBuf      *bytes.Buffer
 	schemaBuf    *bytes.Buffer
 
-	// this map records the result of create table, if a table is created, the value will be true
-	PrepareSQLMap map[string]*SQLCache
-	Database      string
-	WriteTo       bool
-	Batch         int
+	Database string
+	WriteTo  bool
+	Batch    int
 }
 
 type SQLCache struct {
@@ -102,10 +143,9 @@ func NewWorker(dsn, database string, writeTo bool, batch int) (*Worker, error) {
 		schemaBuf:    &bytes.Buffer{},
 		dataBuf:      &bytes.Buffer{},
 
-		PrepareSQLMap: map[string]*SQLCache{},
-		Database:      database,
-		WriteTo:       writeTo,
-		Batch:         batch,
+		Database: database,
+		WriteTo:  writeTo,
+		Batch:    batch,
 	}
 
 	taos, err := sql.Open("taosSql", url)
@@ -158,7 +198,7 @@ func (w *Worker) Write(data []byte) error {
 	deviceID := string(deviceIDBytes)
 	deviceID = strings.ReplaceAll(deviceID, "-", "_")
 
-	if w.PrepareSQLMap[deviceID] == nil {
+	if !isInit(deviceID) {
 		createTableBuffer.WriteString("CREATE TABLE IF NOT EXISTS ")
 		createTableBuffer.WriteByte('"')
 		createTableBuffer.WriteString(strings.ReplaceAll(deviceID, "-", "_"))
@@ -200,7 +240,7 @@ func (w *Worker) Write(data []byte) error {
 				return err
 			}
 
-			if w.PrepareSQLMap[deviceID] == nil {
+			if !isInit(deviceID) {
 				createTableBuffer.WriteString(`,"`)
 				createTableBuffer.Write(deviceServiceKey)
 				createTableBuffer.WriteString("_")
@@ -216,19 +256,19 @@ func (w *Worker) Write(data []byte) error {
 			dataBuf.WriteString(",")
 			switch valueDataType {
 			case jsonparser.Boolean:
-				if w.PrepareSQLMap[deviceID] == nil {
+				if !isInit(deviceID) {
 					createTableBuffer.WriteString(" BOOL")
 				}
 
 				dataBuf.Write(val)
 			case jsonparser.Number:
-				if w.PrepareSQLMap[deviceID] == nil {
+				if !isInit(deviceID) {
 					createTableBuffer.WriteString(" DOUBLE")
 				}
 
 				dataBuf.Write(val)
 			case jsonparser.String:
-				if w.PrepareSQLMap[deviceID] == nil {
+				if !isInit(deviceID) {
 					createTableBuffer.WriteString(" NCHAR(100)")
 				}
 
@@ -249,7 +289,7 @@ func (w *Worker) Write(data []byte) error {
 		return err
 	}
 
-	if w.PrepareSQLMap[deviceID] == nil {
+	if !isInit(deviceID) {
 		createTableBuffer.WriteString(")")
 		if _, err := w.db.Exec(createTableBuffer.String()); err != nil {
 			return err
@@ -258,28 +298,18 @@ func (w *Worker) Write(data []byte) error {
 		// create statments
 		schemaBuf.WriteString(") ")
 
-		w.PrepareSQLMap[deviceID] = &SQLCache{
-			DeviceID:  deviceID,
-			SchemaSQL: schemaBuf.String(),
-			DataSQLs:  []string{},
-			buf:       &bytes.Buffer{},
-		}
+		initCache(deviceID, schemaBuf.String())
 	}
 
 	dataBuf.WriteString(")")
 
-	w.PrepareSQLMap[deviceID].DataSQLs = append(w.PrepareSQLMap[deviceID].DataSQLs, dataBuf.String())
-	w.PrepareSQLMap[deviceID].count++
-
 	// 上边是根据数据组成sql语句,之后调用tdengine的库写入数据
-	if w.PrepareSQLMap[deviceID] != nil && w.PrepareSQLMap[deviceID].count >= w.Batch {
-		sql := w.PrepareSQLMap[deviceID].String()
+	sql := addCache(deviceID, dataBuf.String(), w.Batch)
 
-		if w.WriteTo {
-			if _, err := w.db.Exec(sql); err != nil {
-				log.Println(err)
-				return err
-			}
+	if sql != "" && w.WriteTo {
+		if _, err := w.db.Exec(sql); err != nil {
+			log.Println(err)
+			return err
 		}
 	}
 
