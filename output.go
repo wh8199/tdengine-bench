@@ -7,54 +7,11 @@ import (
 	"log"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/buger/jsonparser"
 )
-
-var (
-	GlobalCache map[string]*SQLCache = map[string]*SQLCache{}
-	CacheLock   sync.RWMutex
-)
-
-func isInit(deviceID string) bool {
-	CacheLock.RLock()
-	defer CacheLock.RUnlock()
-
-	return GlobalCache[deviceID] != nil
-}
-
-func initCache(deviceID, schemaSQL string) {
-	CacheLock.Lock()
-	defer CacheLock.Unlock()
-
-	GlobalCache[deviceID] = &SQLCache{
-		DeviceID:  deviceID,
-		SchemaSQL: schemaSQL,
-		DataSQLs:  []string{},
-		buf:       &bytes.Buffer{},
-	}
-}
-
-func addCache(deviceID, sql string, batchSize int) string {
-	CacheLock.Lock()
-	defer CacheLock.Unlock()
-
-	GlobalCache[deviceID].DataSQLs = append(GlobalCache[deviceID].DataSQLs, sql)
-	GlobalCache[deviceID].count++
-
-	if GlobalCache[deviceID].count >= batchSize {
-		sql := GlobalCache[deviceID].String()
-
-		GlobalCache[deviceID].count = 0
-		GlobalCache[deviceID].DataSQLs = GlobalCache[deviceID].DataSQLs[:0]
-		return sql
-	}
-
-	return ""
-}
 
 type Output struct {
 	Concurrent      int
@@ -107,34 +64,11 @@ type Worker struct {
 	Database string
 	WriteTo  bool
 	Batch    int
-}
 
-type SQLCache struct {
-	DeviceID  string
-	SchemaSQL string
-	DataSQLs  []string
-	buf       *bytes.Buffer
-	count     int
-}
+	CreateTableMap map[string]bool
 
-func (s *SQLCache) String() string {
-	if len(s.DataSQLs) == 0 {
-		return ""
-	}
-
-	s.buf.Reset()
-
-	s.buf.WriteString(s.SchemaSQL)
-	s.buf.WriteString(" values")
-
-	for i := 0; i < len(s.DataSQLs); i++ {
-		s.buf.WriteString(" ")
-		s.buf.WriteString(s.DataSQLs[i])
-	}
-
-	s.DataSQLs = s.DataSQLs[:0]
-	s.count = 0
-	return s.buf.String()
+	DataSQLs []string
+	count    int
 }
 
 func NewWorker(dsn, database string, writeTo bool, batch int) (*Worker, error) {
@@ -146,6 +80,8 @@ func NewWorker(dsn, database string, writeTo bool, batch int) (*Worker, error) {
 		Database: database,
 		WriteTo:  writeTo,
 		Batch:    batch,
+
+		CreateTableMap: map[string]bool{},
 	}
 
 	taos, err := sql.Open("taosSql", url)
@@ -198,21 +134,20 @@ func (w *Worker) Write(data []byte) error {
 	deviceID := string(deviceIDBytes)
 	deviceID = strings.ReplaceAll(deviceID, "-", "_")
 
-	if !isInit(deviceID) {
+	if !w.CreateTableMap[deviceID] {
 		createTableBuffer.WriteString("CREATE TABLE IF NOT EXISTS ")
 		createTableBuffer.WriteByte('"')
 		createTableBuffer.WriteString(strings.ReplaceAll(deviceID, "-", "_"))
 		createTableBuffer.WriteByte('"')
-
-		schemaBuf.WriteString(`insert into "`)
-		schemaBuf.WriteString(w.Database)
-		schemaBuf.WriteString(`"."`)
-		schemaBuf.WriteString(strings.ReplaceAll(deviceID, "-", "_"))
-		schemaBuf.WriteString(`" (`)
-
 		createTableBuffer.WriteString(` ("time" TIMESTAMP,"reporttime" TIMESTAMP,"reporttimestamp" BIGINT`)
-		schemaBuf.WriteString("time,reporttime,reporttimestamp")
 	}
+
+	schemaBuf.WriteString(`"`)
+	schemaBuf.WriteString(w.Database)
+	schemaBuf.WriteString(`"."`)
+	schemaBuf.WriteString(strings.ReplaceAll(deviceID, "-", "_"))
+	schemaBuf.WriteString(`" (`)
+	schemaBuf.WriteString("time,reporttime,reporttimestamp")
 
 	ts, _, _, err := jsonparser.Get(data, "ts")
 	if err != nil {
@@ -240,35 +175,36 @@ func (w *Worker) Write(data []byte) error {
 				return err
 			}
 
-			if !isInit(deviceID) {
+			if !w.CreateTableMap[deviceID] {
 				createTableBuffer.WriteString(`,"`)
 				createTableBuffer.Write(deviceServiceKey)
 				createTableBuffer.WriteString("_")
 				createTableBuffer.WriteString(strings.ReplaceAll(string(key), "-", "_"))
 				createTableBuffer.WriteByte('"')
-
-				schemaBuf.WriteString(`,"`)
-				schemaBuf.Write(deviceServiceKey)
-				schemaBuf.WriteString("_")
-				schemaBuf.WriteString(strings.ReplaceAll(string(key), "-", "_"))
-				schemaBuf.WriteByte('"')
 			}
+
+			schemaBuf.WriteString(`,"`)
+			schemaBuf.Write(deviceServiceKey)
+			schemaBuf.WriteString("_")
+			schemaBuf.WriteString(strings.ReplaceAll(string(key), "-", "_"))
+			schemaBuf.WriteByte('"')
+
 			dataBuf.WriteString(",")
 			switch valueDataType {
 			case jsonparser.Boolean:
-				if !isInit(deviceID) {
+				if !w.CreateTableMap[deviceID] {
 					createTableBuffer.WriteString(" BOOL")
 				}
 
 				dataBuf.Write(val)
 			case jsonparser.Number:
-				if !isInit(deviceID) {
+				if !w.CreateTableMap[deviceID] {
 					createTableBuffer.WriteString(" DOUBLE")
 				}
 
 				dataBuf.Write(val)
 			case jsonparser.String:
-				if !isInit(deviceID) {
+				if !w.CreateTableMap[deviceID] {
 					createTableBuffer.WriteString(" NCHAR(100)")
 				}
 
@@ -289,27 +225,37 @@ func (w *Worker) Write(data []byte) error {
 		return err
 	}
 
-	if !isInit(deviceID) {
+	if !w.CreateTableMap[deviceID] {
 		createTableBuffer.WriteString(")")
 		if _, err := w.db.Exec(createTableBuffer.String()); err != nil {
 			return err
 		}
 
-		// create statments
-		schemaBuf.WriteString(") ")
-
-		initCache(deviceID, schemaBuf.String())
+		w.CreateTableMap[deviceID] = true
 	}
 
+	schemaBuf.WriteString(") values ")
 	dataBuf.WriteString(")")
+	schemaBuf.Write(dataBuf.Bytes())
 
-	// 上边是根据数据组成sql语句,之后调用tdengine的库写入数据
-	sql := addCache(deviceID, dataBuf.String(), w.Batch)
+	w.DataSQLs = append(w.DataSQLs, schemaBuf.String())
+	w.count++
+	if w.count >= w.Batch {
+		dataBuf.Reset()
 
-	if sql != "" && w.WriteTo {
-		if _, err := w.db.Exec(sql); err != nil {
-			log.Println(err)
-			return err
+		dataBuf.WriteString("insert into ")
+		for i := 0; i < len(w.DataSQLs); i++ {
+			dataBuf.WriteString(" ")
+			dataBuf.WriteString(w.DataSQLs[i])
+		}
+		w.count = 0
+
+		w.DataSQLs = w.DataSQLs[:0]
+
+		if w.WriteTo {
+			if _, err := w.db.Exec(dataBuf.String()); err != nil {
+				log.Println(err)
+			}
 		}
 	}
 
